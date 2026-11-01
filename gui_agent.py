@@ -12,9 +12,24 @@ os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 
 SYSTEM_PROMPT = (
     "Вы — ИИ-Агент прямого чтения (Direct-Read Agent). Ваши ответы должны основываться "
-    "исключительно на тексте прочитанных файлов. Если пользователь спрашивает о документе, "
-    "используйте инструмент чтения. Будьте точны, честны и не выдумывайте факты, которых нет в тексте."
+    "исключительно на тексте прочитанных файлов. Чтобы узнать, какие файлы вам доступны, "
+    "вызовите инструмент list_local_files. Если пользователь спрашивает о конкретном документе, "
+    "используйте инструмент чтения read_local_file. Будьте точны, честны и не выдумывайте факты."
 )
+
+def list_local_files() -> str:
+    """Инструмент просмотра списка файлов в папке text_for_AI."""
+    try:
+        if not os.path.exists(DOCUMENTS_DIR):
+            return "Ошибка: Папка с документами не найдена."
+        files = os.listdir(DOCUMENTS_DIR)
+        # Исключаем технический маркер гита из списка для ИИ
+        files = [f for f in files if f != ".gitkeep"]
+        if not files:
+            return "В папке text_for_AI сейчас нет доступных файлов."
+        return f"В папке доступны следующие файлы: {', '.join(files)}"
+    except Exception as e:
+        return f"Ошибка при получении списка файлов: {str(e)}"
 
 def read_local_file(filename: str) -> str:
     """Инструмент прямого чтения файлов из папки text_for_AI."""
@@ -71,24 +86,37 @@ if user_input := st.chat_input("Задайте вопрос по вашим до
     
     st.session_state.messages.append({"role": "user", "content": user_input})
     
-    # Определение инструментов
-    tools = [{
-        'type': 'function',
-        'function': {
-            'name': 'read_local_file',
-            'description': 'Читает полное содержимое указанного файла (.txt, .md, .pdf) из локальной папки документов.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'filename': {
-                        'type': 'string',
-                        'description': 'Имя файла с расширением (например, report.pdf, notes.txt)',
-                    },
+    # Определение инструментов (теперь их два)
+    tools = [
+        {
+            'type': 'function',
+            'function': {
+                'name': 'list_local_files',
+                'description': 'Возвращает список всех файлов, которые лежат в локальной папке документов. Используйте этот инструмент, если пользователь спрашивает, какие файлы у вас есть, или просит сделать обзор папки.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {},
                 },
-                'required': ['filename'],
             },
         },
-    }]
+        {
+            'type': 'function',
+            'function': {
+                'name': 'read_local_file',
+                'description': 'Читает полное содержимое указанного файла (.txt, .md, .pdf) из локальной папки документов.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'filename': {
+                            'type': 'string',
+                            'description': 'Имя файла с расширением (например, report.pdf, notes.txt)',
+                        },
+                    },
+                    'required': ['filename'],
+                },
+            },
+        }
+    ]
     
     # Генерация ответа ИИ
     with st.chat_message("assistant"):
@@ -101,36 +129,44 @@ if user_input := st.chat_input("Задайте вопрос по вашим до
                     tools=tools
                 )
                 
-                # Проверяем вызов инструмента
+                # Проверяем вызов инструментов
                 if response.message.tool_calls:
+                    # Добавляем техническое решение модели в историю сообщений
+                    st.session_state.messages.append(response.message)
+                    
                     for tool in response.message.tool_calls:
-                        if tool.function.name == 'read_local_file':
-                            filename = tool.function.arguments.get('filename')
+                        if tool.function.name == 'list_local_files':
+                            st.info("🔍 *ИИ проверяет список файлов в папке...*")
+                            result_content = list_local_files()
                             
-                            # Визуальный маркер вызова инструмента в чате
-                            st.info(f"🔍 *ИИ читает файл: {filename}*")
-                            
-                            file_content = read_local_file(filename)
-                            
-                            # Добавляем вызов инструмента и его ответ в историю
-                            st.session_state.messages.append(response.message)
                             st.session_state.messages.append({
                                 'role': 'tool',
-                                'content': file_content,
+                                'content': result_content,
                                 'name': tool.function.name
                             })
                             
-                            # Финальный генеративный ответ
-                            final_response = ollama.chat(
-                                model='gemma4',
-                                messages=st.session_state.messages
-                            )
-                            st.write(final_response.message.content)
-                            st.session_state.messages.append(
-                                {"role": "assistant", "content": final_response.message.content}
-                            )
+                        elif tool.function.name == 'read_local_file':
+                            filename = tool.function.arguments.get('filename')
+                            st.info(f"🔍 *ИИ читает файл: {filename}*")
+                            result_content = read_local_file(filename)
+                            
+                            st.session_state.messages.append({
+                                'role': 'tool',
+                                'content': result_content,
+                                'name': tool.function.name
+                            })
+                    
+                    # Финальный генеративный ответ на основе собранных данных
+                    final_response = ollama.chat(
+                        model='gemma4',
+                        messages=st.session_state.messages
+                    )
+                    st.write(final_response.message.content)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": final_response.message.content}
+                    )
                 else:
-                    # Обычный ответ, если файл читать не потребовалось
+                    # Обычный ответ, если вызов инструментов не потребовался
                     st.write(response.message.content)
                     st.session_state.messages.append(
                         {"role": "assistant", "content": response.message.content}
