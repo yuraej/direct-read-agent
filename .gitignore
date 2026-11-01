@@ -1,0 +1,12 @@
+# Виртуальное окружение
+.venv/
+venv/
+
+# Локальные документы (не полетят в облако)
+text_for_AI/*
+!text_for_AI/.gitkeep
+
+# Кэш Python и Streamlit
+__pycache__/
+*.pyc
+.streamlit/
