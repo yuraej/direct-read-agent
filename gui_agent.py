@@ -1,175 +1,94 @@
 import os
-from pypdf import PdfReader
-import ollama
 import streamlit as st
+from archivist import Archivist
+import config
+import core_chat
 
-# Настройка страницы чата
-st.set_page_config(page_title="ИИ-Агент прямого чтения", page_icon="🤖", layout="centered")
+st.set_page_config(page_title="Локальный ИИ-Ассистент 2.0", page_icon="🤖", layout="centered")
 
-# Путь к папке с документами
-DOCUMENTS_DIR = os.path.join(os.path.dirname(__file__), "text_for_AI")
-os.makedirs(DOCUMENTS_DIR, exist_ok=True)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOCUMENTS_DIR = os.path.join(BASE_DIR, "text_for_AI")
 
-SYSTEM_PROMPT = (
-    "Вы — ИИ-Агент прямого чтения (Direct-Read Agent). Ваши ответы должны основываться "
-    "исключительно на тексте прочитанных файлов. Чтобы узнать, какие файлы вам доступны, "
-    "вызовите инструмент list_local_files. Если пользователь спрашивает о конкретном документе, "
-    "используйте инструмент чтения read_local_file. Будьте точны, честны и не выдумывайте факты."
-)
+st.title("🤖 Локальный Юридический Ассистент")
 
-def list_local_files() -> str:
-    """Инструмент просмотра списка файлов в папке text_for_AI."""
-    try:
-        if not os.path.exists(DOCUMENTS_DIR):
-            return "Ошибка: Папка с документами не найдена."
-        files = os.listdir(DOCUMENTS_DIR)
-        # Исключаем технический маркер гита из списка для ИИ
-        files = [f for f in files if f != ".gitkeep"]
-        if not files:
-            return "В папке text_for_AI сейчас нет доступных файлов."
-        return f"В папке доступны следующие файлы: {', '.join(files)}"
-    except Exception as e:
-        return f"Ошибка при получении списка файлов: {str(e)}"
+# 1. СКАНИРОВАНИЕ ДОСТУПНЫХ БАЗ ЗНАНИЙ
+if not os.path.exists(DOCUMENTS_DIR):
+    st.error(f"Папка {DOCUMENTS_DIR} не найдена! Создайте её и положите туда базы данных.")
+    st.stop()
 
-def read_local_file(filename: str) -> str:
-    """Инструмент прямого чтения файлов из папки text_for_AI."""
-    safe_filename = os.path.basename(filename)
-    file_path = os.path.join(DOCUMENTS_DIR, safe_filename)
+# Находим все подпапки внутри text_for_AI (например, zozpp)
+available_folders = [f for f in os.listdir(DOCUMENTS_DIR) if os.path.isdir(os.path.join(DOCUMENTS_DIR, f))]
+
+if not available_folders:
+    st.warning("📥 Хранилище пусто. Добавьте папку с законом (например, 'zozpp') внутрь папки `text_for_AI`.")
+    st.stop()
+
+# Выпадающий список для выбора активного документа
+selected_folder = st.selectbox("Выберите активную базу знаний / закон:", available_folders)
+
+# 2. ИНИЦИАЛИЗАЦИЯ И СБРОС СЕССИИ ПРИ СМЕНЕ ДОКУМЕНТА
+if "current_folder" not in st.session_state or st.session_state.current_folder != selected_folder:
+    st.session_state.current_folder = selected_folder
     
-    if not os.path.exists(file_path):
-        return f"Ошибка: Файл '{safe_filename}' не найден в папке {DOCUMENTS_DIR}."
+    # Инициализируем Архивариуса для чтения карты понятий
+    archivist = Archivist(base_dir=DOCUMENTS_DIR)
+    concept_map = archivist.get_concept_map(selected_folder)
     
-    ext = os.path.splitext(safe_filename)[1].lower()
+    if not concept_map:
+        st.error(f"Не удалось загрузить карту понятий для папки '{selected_folder}'. Проверьте наличие concept_map.json.")
+        st.stop()
+        
+    # Генерируем жесткий системный промпт со встроенной картой понятий
+    system_prompt = config.generate_system_prompt(concept_map)
     
-    try:
-        if ext in ['.txt', '.md']:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read()
-                
-        elif ext == '.pdf':
-            reader = PdfReader(file_path)
-            text_parts = []
-            for i, page in enumerate(reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    text_parts.append(f"--- Страница {i+1} ---\n{page_text}")
-            return "\n".join(text_parts) if text_parts else "PDF файл пуст или не содержит печатного текста."
-            
-        else:
-            return f"Ошибка: Формат {ext} не поддерживается. Разрешены только .txt, .md, .pdf."
-            
-    except Exception as e:
-        return f"Ошибка при чтении файла: {str(e)}"
+    # Записываем первое системное сообщение в историю (оно будет висеть в окне всегда)
+    st.session_state.messages = [{"role": "system", "content": system_prompt}]
 
-# Заголовок интерфейса
-st.title("🤖 ИИ-Агент прямого чтения")
-st.caption(f"Локальная модель: **gemma4** | Папка документов: `{DOCUMENTS_DIR}`")
-
-# Инициализация истории сообщений в сессии браузера
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-# Отображение истории чата (кроме системного промпта)
+# 3. ОТОБРАЖЕНИЕ ИСТОРИИ ДИАЛОГА (Пропускаем системный промпт, показываем только чат)
 for msg in st.session_state.messages:
     if msg["role"] == "user":
-        with st.chat_message("user"):
+        with st.chat_message("user"): 
             st.write(msg["content"])
-    elif msg["role"] == "assistant":
-        with st.chat_message("assistant"):
+    elif msg["role"] == "assistant" and msg.get("content"):
+        with st.chat_message("assistant"): 
             st.write(msg["content"])
 
-# Поле ввода для пользователя
-if user_input := st.chat_input("Задайте вопрос по вашим документам..."):
-    # Отображаем вопрос пользователя
-    with st.chat_message("user"):
+# 4. ПОЛЕ ВВОДА ВОПРОСА И СТАРТ ФУНКЦИОНАЛА
+if user_input := st.chat_input("Задайте вопрос по выбранному документу..."):
+    # Выводим вопрос пользователя на экран и сохраняем в историю
+    with st.chat_message("user"): 
         st.write(user_input)
-    
     st.session_state.messages.append({"role": "user", "content": user_input})
-    
-    # Определение инструментов (теперь их два)
-    tools = [
-        {
-            'type': 'function',
-            'function': {
-                'name': 'list_local_files',
-                'description': 'Возвращает список всех файлов, которые лежат в локальной папке документов. Используйте этот инструмент, если пользователь спрашивает, какие файлы у вас есть, или просит сделать обзор папки.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {},
-                },
-            },
-        },
-        {
-            'type': 'function',
-            'function': {
-                'name': 'read_local_file',
-                'description': 'Читает полное содержимое указанного файла (.txt, .md, .pdf) из локальной папки документов.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'filename': {
-                            'type': 'string',
-                            'description': 'Имя файла с расширением (например, report.pdf, notes.txt)',
-                        },
-                    },
-                    'required': ['filename'],
-                },
-            },
-        }
-    ]
-    
-    # Генерация ответа ИИ
+
+    # Начинаем генерацию ответа ИИ
     with st.chat_message("assistant"):
-        with st.spinner("ИИ думает..."):
+        with st.spinner("ИИ анализирует карту понятий..."):
             try:
-                # Первый запрос к модели
-                response = ollama.chat(
-                    model='gemma4',
+                archivist = Archivist(base_dir=DOCUMENTS_DIR)
+                
+                # Создаем контейнер для красивого вывода плашек прямо во время работы
+                status_container = st.container()
+                
+                # Функция-колбэк, которую core_chat вызовет, если gemma4 запросит статью
+                def show_archive_status(article_id):
+                    with status_container:
+                        st.info(f"🔍 *Архивариус извлекает монолит с SSD: {article_id.upper()}*")
+                
+                # Вызываем наше новое ядро чата с поддержкой "чистого стола"
+                answer, updated_history = core_chat.run_chat_step_archive(
                     messages=st.session_state.messages,
-                    tools=tools
+                    archivist_instance=archivist,
+                    law_folder=selected_folder,
+                    trigger_callback=show_archive_status
                 )
                 
-                # Проверяем вызов инструментов
-                if response.message.tool_calls:
-                    # Добавляем техническое решение модели в историю сообщений
-                    st.session_state.messages.append(response.message)
-                    
-                    for tool in response.message.tool_calls:
-                        if tool.function.name == 'list_local_files':
-                            st.info("🔍 *ИИ проверяет список файлов в папке...*")
-                            result_content = list_local_files()
-                            
-                            st.session_state.messages.append({
-                                'role': 'tool',
-                                'content': result_content,
-                                'name': tool.function.name
-                            })
-                            
-                        elif tool.function.name == 'read_local_file':
-                            filename = tool.function.arguments.get('filename')
-                            st.info(f"🔍 *ИИ читает файл: {filename}*")
-                            result_content = read_local_file(filename)
-                            
-                            st.session_state.messages.append({
-                                'role': 'tool',
-                                'content': result_content,
-                                'name': tool.function.name
-                            })
-                    
-                    # Финальный генеративный ответ на основе собранных данных
-                    final_response = ollama.chat(
-                        model='gemma4',
-                        messages=st.session_state.messages
-                    )
-                    st.write(final_response.message.content)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": final_response.message.content}
-                    )
-                else:
-                    # Обычный ответ, если вызов инструментов не потребовался
-                    st.write(response.message.content)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": response.message.content}
-                    )
+                # Выводим готовый ответ пользователю в Markdown
+                st.write(answer)
+                
+                # Фиксируем очищенную историю (без тяжелых статей) в сессии
+                st.session_state.messages = updated_history
+                # Добавляем финальный ответ ассистента в историю диалога
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                
             except Exception as e:
-                st.error(f"Произошла ошибка: {e}")
+                st.error(f"Произошла ошибка при обработке запроса: {e}")
