@@ -65,22 +65,8 @@ class Archivist:
         return results 
 
 
-# === АВТОНОМНЫЙ ТЕСТ МОДУЛЯ НА НОВОЙ ПЛОСКОЙ СТРУКТУРЕ ===
 if __name__ == "__main__": 
     print("--- ТЕСТИРОВАНИЕ НОВОГО УНИВЕРСАЛЬНОГО АРХИВАРИУСА ---") 
     archivist = Archivist() 
-
-    # Тестируем чтение из вашей реальной новой папки zozpp
-    print("\n1. Проверка чтения карты понятий:")
     cmap = archivist.get_concept_map("zozpp")
-    print(f"Успешно прочитано концептов из text_for_AI/zozpp/: {len(cmap)}")
-
-    print("\n2. Симуляция извлечения статей:")
-    # Специально берем кривые ключи, включая те, что есть в вашем полном law_body.json
-    test_request = ["ст. 20, п. 1", "СТАТЬЯ 9-1, п. 2", "ст38-1", "статья   1", "ст. 42"] 
-    retrieved_documents = archivist.get_articles(law_folder="zozpp", required_keys=test_request) 
-
-    print("\n3. Проверка выданных текстовых монолитов:")
-    for art_title, text in retrieved_documents.items():
-        print(f"\nВывеска: [{art_title}]") 
-        print(f"Текст: {text[:90]}...")
+    print(f"Успешно прочитано концептов: {len(cmap)}")
