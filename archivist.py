@@ -3,8 +3,8 @@ import re
 
 
 class Archivist:
-    def __init__(self, db_path="library.db", base_dir=None):
-        """Инициализация Архивариуса (base_dir оставлен для совместимости с gui_agent.py)"""
+    def __init__(self, db_path="library.db"):
+        """Инициализация Архивариуса"""
         self.db_path = db_path
         self._init_db()
 
@@ -53,17 +53,43 @@ class Archivist:
             rows = conn.execute("SELECT id, title, scope FROM laws").fetchall()
             return [dict(r) for r in rows]
 
-    def get_concept_map(self, law_folder: str) -> list:
-        """Достает карту понятий из БД вместо concept_map.json"""
+    def get_concept_map(self, law_id: str) -> list:
+        """Достает карту понятий из БД с обработкой пустых описаний"""
         with self._get_conn() as conn:
             rows = conn.execute(
-                "SELECT node_key as article, concept_summary as description FROM nodes WHERE law_id = ?",
-                (law_folder,)
+                "SELECT node_key, concept_summary, full_text FROM nodes WHERE law_id = ?",
+                (law_id,)
             ).fetchall()
-            return [dict(r) for r in rows]
+            
+            result = []
+            for row in rows:
+                # Если concept_summary пустой, берем первую строку full_text
+                summary = row['concept_summary']
+                if not summary or summary == "Описание отсутствует":
+                    # Разбиваем full_text по разделителям статей
+                    article_text = row['full_text'].split('\n')[0]  # Первая строка как заголовок
+                    summary = article_text
+                    
+                result.append({
+                    "article": row['node_key'],
+                    "description": summary
+                })
+                
+            return result
 
-    def _normalize_key(self, raw_key: str) -> str:
-        """Оригинальный фильтр ключей"""
+    def _normalize_key(self, raw_key: str, law_id: str) -> str:
+        """Оригинальный фильтр ключей с проверкой в БД"""
+        # Сначала проверяем точное совпадение в БД
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM nodes WHERE law_id = ? AND node_key = ?",
+                (law_id, raw_key)
+            ).fetchone()
+            
+            if row:
+                return raw_key
+        
+        # Если точного совпадения нет, применяем фильтрацию
         raw_key = raw_key.strip()
         match = re.search(r'(?:ст\.?|статья)\s*([0-9]+(?:-[0-9]+)?)', raw_key, re.IGNORECASE)
         if match:
@@ -73,21 +99,21 @@ class Archivist:
             return f"статья{fallback_match.group(1)}"
         return raw_key.lower().replace(" ", "")
 
-    def get_articles(self, law_folder: str, required_keys: list) -> dict:
-        """Достает статьи из БД + прикрепляет ссылки на постановления/другие статьи"""
+    def get_articles(self, law_id: str, required_keys: list) -> dict:
+        """Достает статьи из БД + прикрепляет ссылки на постановления"""
         results = {}
         with self._get_conn() as conn:
             for raw_key in required_keys:
-                target_article = self._normalize_key(raw_key)
-                print(f"[Архивариус БД] Запрос ИИ: '{raw_key}' ➡ Раздел: '{law_folder}', Ключ: '{target_article}'")
+                target_article = self._normalize_key(raw_key, law_id)
+                print(f"[Архивариус БД] Запрос ИИ: '{raw_key}' ➡ Раздел: '{law_id}', Ключ: '{target_article}'")
 
                 row = conn.execute(
                     "SELECT full_text FROM nodes WHERE law_id = ? AND node_key = ?",
-                    (law_folder, target_article)
+                    (law_id, target_article)
                 ).fetchone()
 
                 if not row:
-                    results[target_article] = f"[СИСТЕМНОЕ УВЕДОМЛЕНИЕ] Документ '{target_article}' отсутствует в разделе '{law_folder}'."
+                    results[target_article] = f"[СИСТЕМНОЕ УВЕДОМЛЕНИЕ] Документ '{target_article}' отсутствует в разделе '{law_id}'."
                     continue
 
                 text = row["full_text"]
@@ -96,7 +122,7 @@ class Archivist:
                     SELECT target_law, target_key, trigger_note 
                     FROM edges 
                     WHERE source_law = ? AND source_key = ?
-                """, (law_folder, target_article)).fetchall()
+                """, (law_id, target_article)).fetchall()
 
                 if links:
                     links_block = "\n\n--- СВЯЗАННЫЕ НОРМЫ И ПОДЗАКОННЫЕ АКТЫ ---\n"

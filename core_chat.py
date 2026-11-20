@@ -1,75 +1,69 @@
 import ollama
-from archivist import Archivist
-from config import LAW_TOOLS
+import json
+from config import MODEL_NAME, LAW_TOOLS
 
-def run_chat_step_archive(messages: list, archivist_instance: Archivist, law_folder: str, trigger_callback=None) -> tuple:
+def run_chat_step_archive(messages: list, archivist_instance, trigger_callback=None) -> tuple:
     """
-    Ядро взаимодействия с моделью gemma4 через Native Tool Calling с режимом 'Чистого стола'.
-    Принимает историю сообщений, экземпляр Архивариуса и имя активной папки.
-    Возвращает: (финальный_текст_ответа, обновленная_чистая_история_сообщений)
+    Ядро с многошаговым циклом (до 6 итераций) и механизмом Garbage Collection.
     """
+    start_len = len(messages)
     
-    # Шаг 1: Первичный запрос к Ollama с передачей паспорта инструментов
-    response = ollama.chat(
-        model="gemma4",
-        messages=messages,
-        tools=LAW_TOOLS
-    )
-    
-    # Шаг 2: Проверяем, решила ли модель вызвать инструмент (Архив)
-    if response.get("message", {}).get("tool_calls"):
-        tool_calls = response["message"]["tool_calls"]
-        
-        # Добавляем технический ответ модели (с намерением вызвать инструмент) в историю
-        messages.append(response["message"])
-        
-        # Обрабатываем каждый вызов инструмента от модели
-        for tool in tool_calls:
-            if tool["function"]["name"] == "get_law_articles":
-                # Извлекаем аргументы, которые сгенерировала gemma4
-                args = tool["function"]["arguments"]
-                required_keys = args.get("required_keys", [])
-                folder = args.get("law_folder", law_folder) # берем из ИИ или системный фолбэк
-                
-                # Запускаем визуальный колбэк в интерфейсе, если он передан
-                if trigger_callback:
-                    for key in required_keys:
-                        trigger_callback(key)
-                
-                # Обращаемся к Архивариусу за монолитами статей
-                retrieved_dict = archivist_instance.get_articles(law_folder=folder, required_keys=required_keys)
-                
-                # СКЛЕЙКА: Переводим словарь Архивариуса в один сплошной Markdown-текст для ИИ
-                clean_articles_text = "\n\n".join(retrieved_dict.values())
-                
-                # Упаковываем прочитанный текст в сообщение с ролью 'tool'
-                tool_response_message = {
-                    "role": "tool",
-                    "content": clean_articles_text
-                }
-                messages.append(tool_response_message)
-        
-        # Шаг 3: Повторный вызов Ollama — модель изучает выложенные на стол статьи и пишет итог
-        final_response = ollama.chat(
-            model="gemma4",
-            messages=messages
+    for i in range(6):
+        # Шаг 1: Вызов модели с текущей историей и инструментами
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=LAW_TOOLS
         )
         
-        answer = final_response["message"]["content"]
-        
-        # =====================================================================
-        # 🧼 РЕЖИМ «ЧИСТОГО СТОЛА» (GARBAGE COLLECTION)
-        # =====================================================================
-        # Избавляемся от тяжелых данных на лету:
-        # Мы удаляем из истории два последних сообщения: технический Tool Call модели 
-        # и тяжелый текст статьи с ролью 'tool'. 
-        # Модель выдала ответ — контекст больше не должен засоряться монолитами.
-        messages.pop()  # Стираем сообщение 'tool' (текст статей)
-        messages.pop()  # Стираем сообщение 'assistant' (технический вызов инструмента)
-        
-        return answer, messages
+        # Добавляем ответ модели в историю (это важно для контекста)
+        messages.append(response["message"])
 
-    else:
-        # Если модель решила, что статьи ей не нужны (отвечает по общему контексту или карте понятий)
-        answer = response["message"]["content"]
-        return answer, messages
+        # Если модель хочет вызвать инструмент
+        if response.get("message", {}).get("tool_calls"):
+            tool_calls = response["message"]["tool_calls"]
+            
+            for tool in tool_calls:
+                func_name = tool["function"]["name"]
+                args = tool["function"]["arguments"]
+
+                if func_name == "load_concept_map":
+                    law_id = args.get("law_id")
+                    if trigger_callback:
+                        trigger_callback(f"Загрузка карты: {law_id}")
+                    
+                    data = archivist_instance.get_concept_map(law_id)
+                    content = json.dumps(data, ensure_ascii=False)
+                    messages.append({"role": "tool", "content": content})
+
+                elif func_name == "get_law_articles":
+                    law_id = args.get("law_id")
+                    required_keys = args.get("required_keys", [])
+                    if trigger_callback:
+                        trigger_callback(f"Чтение: {law_id} ({len(required_keys)} ст.)")
+                    
+                    retrieved_dict = archivist_instance.get_articles(law_id=law_id, required_keys=required_keys)
+                    content = "\n\n".join(retrieved_dict.values())
+                    messages.append({"role": "tool", "content": content})
+
+            # После выполнения всех tool_calls, продолжаем цикл, чтобы модель проанализировала результат
+            continue 
+        
+        else:
+            # Модель выдала финальный текстовый ответ (tool_calls нет)
+            final_answer = response["message"]["content"]
+            
+            # --- РЕЖИМ «ЧИСТОГО СТОЛА» ---
+            # Оставляем только исходный запрос пользователя и финальный ответ
+            # (Включая системный промпт, который идет первым)
+            messages = messages[:start_len]
+            # Добавляем только финальный ответ ассистента (без технических сообщений о вызовах)
+            # Но так как мы сделали messages.append в начале цикла, 
+            # в messages[:start_len] сейчас только [system, user, ...user_msgs]
+            # Нам нужно добавить последний чистый ответ.
+            # Однако, если мы хотим оставить историю диалога корректной,
+            # лучше просто вернуть очищенную историю и добавить финальный ответ отдельно.
+            return final_answer, messages
+
+    # Если цикл завершился без финального ответа (редкий случай)
+    return messages[-1]["content"], messages
